@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use android_activity::input::{InputEvent, KeyAction, Keycode, MotionAction};
+use android_activity::input::{InputEvent, KeyAction, Keycode, MotionAction, TextInputState};
 use android_activity::{
     AndroidApp, AndroidAppWaker, ConfigurationRef, InputStatus, MainEvent, Rect,
 };
@@ -16,7 +16,7 @@ use crate::cursor::Cursor;
 use crate::dpi::{PhysicalPosition, PhysicalSize, Position, Size};
 use crate::error;
 use crate::error::EventLoopError;
-use crate::event::{self, Force, InnerSizeWriter, StartCause};
+use crate::event::{self, Force, Ime, InnerSizeWriter, StartCause};
 use crate::event_loop::{self, ActiveEventLoop as RootAEL, ControlFlow, DeviceEvents};
 use crate::platform::pump_events::PumpStatus;
 use crate::platform_impl::Fullscreen;
@@ -143,6 +143,18 @@ pub struct EventLoop<T: 'static> {
     cause: StartCause,
     ignore_volume_keys: bool,
     combining_accent: Option<char>,
+    ime_state: ImeState,
+}
+
+/// Tracks IME state for generating proper events
+#[derive(Default)]
+struct ImeState {
+    /// Whether IME is currently active
+    active: bool,
+    /// The full text from the previous TextEvent, used to diff and detect changes
+    prev_text: String,
+    /// Previous preedit text, to detect changes
+    preedit_text: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -192,6 +204,7 @@ impl<T: 'static> EventLoop<T> {
             cause: StartCause::Init,
             ignore_volume_keys: attributes.ignore_volume_keys,
             combining_accent: None,
+            ime_state: ImeState::default(),
         })
     }
 
@@ -234,6 +247,34 @@ impl<T: 'static> EventLoop<T> {
                 },
                 MainEvent::LostFocus => {
                     HAS_FOCUS.store(false, Ordering::Relaxed);
+
+                    // Send Ime::Disabled if IME was active
+                    if self.ime_state.active {
+                        // Clear any pending preedit first
+                        if !self.ime_state.preedit_text.is_empty() {
+                            callback(
+                                event::Event::WindowEvent {
+                                    window_id: window::WindowId(WindowId),
+                                    event: event::WindowEvent::Ime(Ime::Preedit(
+                                        String::new(),
+                                        None,
+                                    )),
+                                },
+                                self.window_target(),
+                            );
+                        }
+                        callback(
+                            event::Event::WindowEvent {
+                                window_id: window::WindowId(WindowId),
+                                event: event::WindowEvent::Ime(Ime::Disabled),
+                            },
+                            self.window_target(),
+                        );
+                        self.ime_state.active = false;
+                        self.ime_state.preedit_text.clear();
+                        self.ime_state.prev_text.clear();
+                    }
+
                     callback(
                         event::Event::WindowEvent {
                             window_id: window::WindowId(WindowId),
@@ -466,12 +507,137 @@ impl<T: 'static> EventLoop<T> {
                     },
                 }
             },
+            InputEvent::TextEvent(text_state) => {
+                self.handle_text_input_event(&text_state, callback);
+            },
             _ => {
                 warn!("Unknown android_activity input event {event:?}")
             },
         }
 
         input_status
+    }
+
+    fn handle_text_input_event<F>(&mut self, text_state: &TextInputState, callback: &mut F)
+    where
+        F: FnMut(event::Event<T>, &RootAEL),
+    {
+        let window_id = window::WindowId(WindowId);
+
+        // Send Ime::Enabled if this is the first text event
+        if !self.ime_state.active {
+            self.ime_state.active = true;
+            self.ime_state.prev_text.clear();
+            self.ime_state.preedit_text.clear();
+            callback(
+                event::Event::WindowEvent {
+                    window_id,
+                    event: event::WindowEvent::Ime(Ime::Enabled),
+                },
+                self.window_target(),
+            );
+        }
+
+        // Handle composition (preedit) region
+        if let Some(ref compose_region) = text_state.compose_region {
+            // Extract the preedit text from the compose region
+            // Note: android-activity uses byte indices for TextSpan
+            let start = compose_region.start.min(compose_region.end);
+            let end = compose_region.start.max(compose_region.end);
+
+            // Validate indices are on UTF-8 character boundaries
+            let text = &text_state.text;
+            let start = Self::clamp_to_char_boundary(text, start);
+            let end = Self::clamp_to_char_boundary(text, end);
+
+            let preedit_text = &text[start..end];
+
+            // Calculate cursor position within preedit (selection relative to compose start)
+            let cursor_begin = text_state.selection.start.saturating_sub(start);
+            let cursor_end = text_state.selection.end.saturating_sub(start);
+            let cursor_begin = cursor_begin.min(preedit_text.len());
+            let cursor_end = cursor_end.min(preedit_text.len());
+
+            // Only send if preedit changed
+            if preedit_text != self.ime_state.preedit_text {
+                self.ime_state.preedit_text = preedit_text.to_string();
+                callback(
+                    event::Event::WindowEvent {
+                        window_id,
+                        event: event::WindowEvent::Ime(Ime::Preedit(
+                            preedit_text.to_string(),
+                            Some((cursor_begin, cursor_end)),
+                        )),
+                    },
+                    self.window_target(),
+                );
+            }
+
+            // Update prev_text to the committed portion (text before compose region)
+            self.ime_state.prev_text = text[..start].to_string();
+        } else {
+            // No composition region - all text is committed
+            let current_text = &text_state.text;
+
+            // If we had preedit before, clear it
+            if !self.ime_state.preedit_text.is_empty() {
+                callback(
+                    event::Event::WindowEvent {
+                        window_id,
+                        event: event::WindowEvent::Ime(Ime::Preedit(String::new(), None)),
+                    },
+                    self.window_target(),
+                );
+                self.ime_state.preedit_text.clear();
+            }
+
+            // Detect what text was added by comparing with previous state
+            // This handles the case where preedit was committed or new text was typed directly
+            if current_text != &self.ime_state.prev_text {
+                // Find the common prefix length
+                let common_prefix_len = current_text
+                    .chars()
+                    .zip(self.ime_state.prev_text.chars())
+                    .take_while(|(a, b)| a == b)
+                    .count();
+
+                // Get the byte offset of where the common prefix ends
+                let prefix_byte_len: usize =
+                    current_text.chars().take(common_prefix_len).map(|c| c.len_utf8()).sum();
+
+                // The new text is everything after the common prefix
+                let new_text = &current_text[prefix_byte_len..];
+
+                if !new_text.is_empty() {
+                    callback(
+                        event::Event::WindowEvent {
+                            window_id,
+                            event: event::WindowEvent::Ime(Ime::Commit(new_text.to_string())),
+                        },
+                        self.window_target(),
+                    );
+                }
+            }
+
+            // Update prev_text to current state
+            self.ime_state.prev_text = current_text.clone();
+        }
+    }
+
+    /// Clamp a byte index to the nearest valid UTF-8 character boundary
+    fn clamp_to_char_boundary(s: &str, index: usize) -> usize {
+        if index >= s.len() {
+            s.len()
+        } else if s.is_char_boundary(index) {
+            index
+        } else {
+            // Find the previous valid boundary
+            s.char_indices()
+                .map(|(i, _)| i)
+                .take_while(|&i| i <= index)
+                .last()
+                .unwrap_or(0)
+        }
     }
 
     pub fn run<F>(mut self, event_handler: F) -> Result<(), EventLoopError>
