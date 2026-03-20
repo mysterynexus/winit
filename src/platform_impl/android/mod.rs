@@ -6,13 +6,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use android_activity::input::{InputEvent, KeyAction, Keycode, MotionAction};
+use android_activity::input::{InputEvent, KeyAction, KeyMapChar, Keycode, MotionAction, TextInputState};
 use android_activity::{
     AndroidApp, AndroidAppWaker, ConfigurationRef, InputStatus, MainEvent, Rect,
 };
 use tracing::{debug, trace, warn};
 
 use crate::cursor::Cursor;
+use crate::keyboard::{Key, KeyCode, KeyLocation, NamedKey, NativeKeyCode, PhysicalKey};
 use crate::dpi::{PhysicalPosition, PhysicalSize, Position, Size};
 use crate::error;
 use crate::error::EventLoopError;
@@ -143,6 +144,8 @@ pub struct EventLoop<T: 'static> {
     cause: StartCause,
     ignore_volume_keys: bool,
     combining_accent: Option<char>,
+    previous_ime_text: String,
+    key_event_produced_text: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -192,6 +195,8 @@ impl<T: 'static> EventLoop<T> {
             cause: StartCause::Init,
             ignore_volume_keys: attributes.ignore_volume_keys,
             combining_accent: None,
+            previous_ime_text: String::new(),
+            key_event_produced_text: false,
         })
     }
 
@@ -308,6 +313,7 @@ impl<T: 'static> EventLoop<T> {
         let android_app = self.android_app.clone();
 
         // Process input events
+        self.key_event_produced_text = false;
         match android_app.input_events_iter() {
             Ok(mut input_iter) => loop {
                 let read_event =
@@ -446,6 +452,28 @@ impl<T: 'static> EventLoop<T> {
                             &mut self.combining_accent,
                         );
 
+                        let text = if state == event::ElementState::Pressed {
+                            key_char
+                                .as_ref()
+                                .and_then(|kmc| match kmc {
+                                    KeyMapChar::Unicode(c) => {
+                                        Some(smol_str::SmolStr::from_iter([*c]))
+                                    },
+                                    _ => None,
+                                })
+                        } else {
+                            None
+                        };
+
+                        if text.is_some()
+                            || matches!(
+                                keycode,
+                                Keycode::Del | Keycode::ForwardDel | Keycode::Enter
+                            )
+                        {
+                            self.key_event_produced_text = true;
+                        }
+
                         let event = event::Event::WindowEvent {
                             window_id: window::WindowId(WindowId),
                             event: event::WindowEvent::KeyboardInput {
@@ -456,7 +484,7 @@ impl<T: 'static> EventLoop<T> {
                                     logical_key: keycodes::to_logical(key_char, keycode),
                                     location: keycodes::to_location(keycode),
                                     repeat: key.repeat_count() > 0,
-                                    text: None,
+                                    text,
                                     platform_specific: KeyEventExtra {},
                                 },
                                 is_synthetic: false,
@@ -466,12 +494,94 @@ impl<T: 'static> EventLoop<T> {
                     },
                 }
             },
+            InputEvent::TextEvent(text_state) => {
+                self.handle_text_event(text_state, callback);
+            },
             _ => {
                 warn!("Unknown android_activity input event {event:?}")
             },
         }
 
         input_status
+    }
+
+    fn handle_text_event<F>(&mut self, state: &TextInputState, callback: &mut F)
+    where
+        F: FnMut(event::Event<T>, &RootAEL),
+    {
+        if self.key_event_produced_text {
+            self.previous_ime_text = state.text.clone();
+            return;
+        }
+
+        let old = &self.previous_ime_text;
+        let new = &state.text;
+
+        let common_prefix = old
+            .chars()
+            .zip(new.chars())
+            .take_while(|(old_char, new_char)| old_char == new_char)
+            .count();
+
+        let old_suffix_len = old.chars().count() - common_prefix;
+        let new_suffix: String = new.chars().skip(common_prefix).collect();
+
+        for _ in 0..old_suffix_len {
+            for &key_state in &[event::ElementState::Pressed, event::ElementState::Released] {
+                callback(
+                    event::Event::WindowEvent {
+                        window_id: window::WindowId(WindowId),
+                        event: event::WindowEvent::KeyboardInput {
+                            device_id: event::DeviceId(DeviceId(0)),
+                            event: event::KeyEvent {
+                                state: key_state,
+                                logical_key: Key::Named(NamedKey::Backspace),
+                                physical_key: PhysicalKey::Code(KeyCode::Backspace),
+                                location: KeyLocation::Standard,
+                                repeat: false,
+                                text: None,
+                                platform_specific: KeyEventExtra {},
+                            },
+                            is_synthetic: false,
+                        },
+                    },
+                    self.window_target(),
+                );
+            }
+        }
+
+        for character in new_suffix.chars() {
+            let text = smol_str::SmolStr::from_iter([character]);
+            for &key_state in &[event::ElementState::Pressed, event::ElementState::Released] {
+                callback(
+                    event::Event::WindowEvent {
+                        window_id: window::WindowId(WindowId),
+                        event: event::WindowEvent::KeyboardInput {
+                            device_id: event::DeviceId(DeviceId(0)),
+                            event: event::KeyEvent {
+                                state: key_state,
+                                logical_key: Key::Character(text.clone()),
+                                physical_key: PhysicalKey::Unidentified(
+                                    NativeKeyCode::Unidentified,
+                                ),
+                                location: KeyLocation::Standard,
+                                repeat: false,
+                                text: if key_state == event::ElementState::Pressed {
+                                    Some(text.clone())
+                                } else {
+                                    None
+                                },
+                                platform_specific: KeyEventExtra {},
+                            },
+                            is_synthetic: false,
+                        },
+                    },
+                    self.window_target(),
+                );
+            }
+        }
+
+        self.previous_ime_text = state.text.clone();
     }
 
     pub fn run<F>(mut self, event_handler: F) -> Result<(), EventLoopError>
