@@ -1038,8 +1038,11 @@ impl Window {
         Err(error::ExternalError::NotSupported(error::NotSupportedError::new()))
     }
 
-    pub fn set_cursor_grab(&self, _: CursorGrabMode) -> Result<(), error::ExternalError> {
-        Err(error::ExternalError::NotSupported(error::NotSupportedError::new()))
+    pub fn set_cursor_grab(&self, mode: CursorGrabMode) -> Result<(), error::ExternalError> {
+        match mode {
+            CursorGrabMode::None => Ok(()),
+            _ => Err(error::ExternalError::NotSupported(error::NotSupportedError::new())),
+        }
     }
 
     pub fn set_cursor_visible(&self, _: bool) {}
@@ -1106,7 +1109,7 @@ impl Window {
         if let Some(native_window) = self.app.native_window().as_ref() {
             native_window.raw_window_handle()
         } else {
-            tracing::error!(
+            tracing::warn!(
                 "Cannot get the native window, it's null and will always be null before \
                  Event::Resumed and after Event::Suspended. Make sure you only call this function \
                  between those events."
