@@ -270,27 +270,33 @@ impl<T: 'static> EventLoop<T> {
                 MainEvent::LowMemory => {
                     callback(event::Event::MemoryWarning, self.window_target());
                 },
-                MainEvent::Start => {
-                    // XXX: how to forward this state to applications?
-                    warn!("TODO: forward onStart notification to application");
-                },
+                MainEvent::Start => {},
                 MainEvent::Resume { .. } => {
                     debug!("App Resumed - is running");
                     self.running = true;
+                    callback(
+                        event::Event::WindowEvent {
+                            window_id: window::WindowId(WindowId),
+                            event: event::WindowEvent::Occluded(false),
+                        },
+                        self.window_target(),
+                    );
                 },
                 MainEvent::SaveState { .. } => {
-                    // XXX: how to forward this state to applications?
-                    // XXX: also how do we expose state restoration to apps?
                     warn!("TODO: forward saveState notification to application");
                 },
                 MainEvent::Pause => {
                     debug!("App Paused - stopped running");
                     self.running = false;
+                    callback(
+                        event::Event::WindowEvent {
+                            window_id: window::WindowId(WindowId),
+                            event: event::WindowEvent::Occluded(true),
+                        },
+                        self.window_target(),
+                    );
                 },
-                MainEvent::Stop => {
-                    // XXX: how to forward this state to applications?
-                    warn!("TODO: forward onStop notification to application");
-                },
+                MainEvent::Stop => {},
                 MainEvent::Destroy => {
                     // XXX: maybe exit mainloop to drop things before being
                     // killed by the OS?

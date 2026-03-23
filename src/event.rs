@@ -415,10 +415,18 @@ pub enum WindowEvent {
     /// [`applicationDidEnterBackground`]: https://developer.apple.com/documentation/uikit/uiapplicationdelegate/1622997-applicationdidenterbackground
     /// [iOS application lifecycle]: https://developer.apple.com/documentation/uikit/app_and_environment/managing_your_app_s_life_cycle
     ///
+    /// ### Android
+    ///
+    /// On Android, the `Occluded(false)` event is emitted in response to
+    /// [`onResume`] and `Occluded(true)` is emitted in response to [`onPause`].
+    ///
+    /// [`onResume`]: https://developer.android.com/reference/android/app/Activity#onResume()
+    /// [`onPause`]: https://developer.android.com/reference/android/app/Activity#onPause()
+    ///
     /// ### Others
     ///
     /// - **Web:** Doesn't take into account CSS [`border`], [`padding`], or [`transform`].
-    /// - **Android / Wayland / Windows / Orbital:** Unsupported.
+    /// - **Wayland / Windows / Orbital:** Unsupported.
     ///
     /// [`border`]: https://developer.mozilla.org/en-US/docs/Web/CSS/border
     /// [`padding`]: https://developer.mozilla.org/en-US/docs/Web/CSS/padding
