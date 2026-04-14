@@ -4,7 +4,7 @@ use std::collections::{HashMap, VecDeque};
 use std::ptr;
 
 use objc2::rc::{Retained, WeakId};
-use objc2::runtime::{AnyObject, Sel};
+use objc2::runtime::{AnyClass, AnyObject, ClassBuilder, Sel};
 use objc2::{declare_class, extern_class, msg_send_id, mutability, sel, ClassType, DeclaredClass};
 use objc2_app_kit::{
     NSApplication, NSCursor, NSEvent, NSEventPhase, NSResponder, NSTextInputClient,
@@ -41,6 +41,19 @@ extern_class!(
         const NAME: &'static str = "MTKView";
     }
 );
+
+fn ensure_mtkview_class() {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        if AnyClass::get("MTKView").is_none() {
+            let super_cls = <NSView as ClassType>::class();
+            let builder = ClassBuilder::new("MTKView", super_cls)
+                .expect("failed to create MTKView stub class");
+            builder.register();
+        }
+    });
+}
 
 #[derive(Debug)]
 struct CursorState {
@@ -794,6 +807,8 @@ impl WinitView {
         accepts_first_mouse: bool,
         option_as_alt: OptionAsAlt,
     ) -> Retained<Self> {
+        ensure_mtkview_class();
+
         let mtm = MainThreadMarker::from(window);
         let this = mtm.alloc().set_ivars(ViewState {
             app_delegate: app_delegate.retain(),
