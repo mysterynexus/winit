@@ -6,19 +6,19 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use android_activity::input::{InputEvent, KeyAction, KeyMapChar, Keycode, MotionAction, TextInputState};
+use android_activity::input::{InputEvent, KeyAction, Keycode, MotionAction, TextInputState};
 use android_activity::{
     AndroidApp, AndroidAppWaker, ConfigurationRef, InputStatus, MainEvent, Rect,
 };
 use tracing::{debug, trace, warn};
 
 use crate::cursor::Cursor;
-use crate::keyboard::{Key, KeyCode, KeyLocation, NamedKey, NativeKeyCode, PhysicalKey};
 use crate::dpi::{PhysicalPosition, PhysicalSize, Position, Size};
 use crate::error;
 use crate::error::EventLoopError;
 use crate::event::{self, Force, InnerSizeWriter, StartCause};
 use crate::event_loop::{self, ActiveEventLoop as RootAEL, ControlFlow, DeviceEvents};
+use crate::keyboard::{Key, KeyCode, KeyLocation, NamedKey, NativeKeyCode, PhysicalKey};
 use crate::platform::pump_events::PumpStatus;
 use crate::platform_impl::Fullscreen;
 use crate::window::{
@@ -26,6 +26,7 @@ use crate::window::{
     WindowButtons, WindowLevel,
 };
 
+mod ime;
 mod keycodes;
 
 pub(crate) use crate::cursor::{
@@ -144,8 +145,7 @@ pub struct EventLoop<T: 'static> {
     cause: StartCause,
     ignore_volume_keys: bool,
     combining_accent: Option<char>,
-    previous_ime_text: String,
-    key_event_produced_text: bool,
+    ime_state: ime::ImeState,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -195,8 +195,7 @@ impl<T: 'static> EventLoop<T> {
             cause: StartCause::Init,
             ignore_volume_keys: attributes.ignore_volume_keys,
             combining_accent: None,
-            previous_ime_text: String::new(),
-            key_event_produced_text: false,
+            ime_state: ime::ImeState::default(),
         })
     }
 
@@ -319,7 +318,7 @@ impl<T: 'static> EventLoop<T> {
         let android_app = self.android_app.clone();
 
         // Process input events
-        self.key_event_produced_text = false;
+        self.ime_state.begin_input_batch();
         match android_app.input_events_iter() {
             Ok(mut input_iter) => loop {
                 let read_event =
@@ -458,27 +457,17 @@ impl<T: 'static> EventLoop<T> {
                             &mut self.combining_accent,
                         );
 
+                        let logical_key = keycodes::to_logical(key_char, keycode);
                         let text = if state == event::ElementState::Pressed {
-                            key_char
-                                .as_ref()
-                                .and_then(|kmc| match kmc {
-                                    KeyMapChar::Unicode(c) => {
-                                        Some(smol_str::SmolStr::from_iter([*c]))
-                                    },
-                                    _ => None,
-                                })
+                            logical_key.to_text().map(smol_str::SmolStr::new)
                         } else {
                             None
                         };
 
-                        if text.is_some()
-                            || matches!(
-                                keycode,
-                                Keycode::Del | Keycode::ForwardDel | Keycode::Enter
-                            )
-                        {
-                            self.key_event_produced_text = true;
-                        }
+                        self.ime_state.record_key_event(
+                            text.is_some(),
+                            matches!(keycode, Keycode::Del | Keycode::ForwardDel | Keycode::Enter),
+                        );
 
                         let event = event::Event::WindowEvent {
                             window_id: window::WindowId(WindowId),
@@ -487,7 +476,7 @@ impl<T: 'static> EventLoop<T> {
                                 event: event::KeyEvent {
                                     state,
                                     physical_key: keycodes::to_physical_key(keycode),
-                                    logical_key: keycodes::to_logical(key_char, keycode),
+                                    logical_key,
                                     location: keycodes::to_location(keycode),
                                     repeat: key.repeat_count() > 0,
                                     text,
@@ -515,24 +504,11 @@ impl<T: 'static> EventLoop<T> {
     where
         F: FnMut(event::Event<T>, &RootAEL),
     {
-        if self.key_event_produced_text {
-            self.previous_ime_text = state.text.clone();
+        let Some(edit) = self.ime_state.update_text(&state.text) else {
             return;
-        }
+        };
 
-        let old = &self.previous_ime_text;
-        let new = &state.text;
-
-        let common_prefix = old
-            .chars()
-            .zip(new.chars())
-            .take_while(|(old_char, new_char)| old_char == new_char)
-            .count();
-
-        let old_suffix_len = old.chars().count() - common_prefix;
-        let new_suffix: String = new.chars().skip(common_prefix).collect();
-
-        for _ in 0..old_suffix_len {
+        for _ in 0..edit.backspaces {
             for &key_state in &[event::ElementState::Pressed, event::ElementState::Released] {
                 callback(
                     event::Event::WindowEvent {
@@ -556,7 +532,7 @@ impl<T: 'static> EventLoop<T> {
             }
         }
 
-        for character in new_suffix.chars() {
+        for character in edit.text.chars() {
             let text = smol_str::SmolStr::from_iter([character]);
             for &key_state in &[event::ElementState::Pressed, event::ElementState::Released] {
                 callback(
@@ -586,8 +562,6 @@ impl<T: 'static> EventLoop<T> {
                 );
             }
         }
-
-        self.previous_ime_text = state.text.clone();
     }
 
     pub fn run<F>(mut self, event_handler: F) -> Result<(), EventLoopError>
